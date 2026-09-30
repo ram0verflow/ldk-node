@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -240,6 +240,11 @@ impl Wallet {
 
 	pub(crate) async fn apply_update(&self, update: impl Into<Update>) -> Result<(), Error> {
 		let mut locked_persister = self.persister.lock().await;
+		let mut update = update.into();
+		let superseded = self.superseded_onchain_txids().await?;
+		// A delayed chain-source response must not make an earlier local RBF round
+		// newer than the replacement we have already applied to the wallet.
+		update.tx_update.seen_ats.retain(|(txid, _)| !superseded.contains(txid));
 		let events = {
 			let mut locked_wallet = self.inner.lock().expect("lock");
 			match locked_wallet.apply_update_events(update) {
@@ -265,13 +270,15 @@ impl Wallet {
 
 	#[cfg(feature = "chain-bitcoind")]
 	pub(crate) async fn apply_mempool_txs(
-		&self, unconfirmed_txs: Vec<(Transaction, u64)>, evicted_txids: Vec<(Txid, u64)>,
+		&self, mut unconfirmed_txs: Vec<(Transaction, u64)>, evicted_txids: Vec<(Txid, u64)>,
 	) -> Result<(), Error> {
 		if unconfirmed_txs.is_empty() && evicted_txids.is_empty() {
 			return Ok(());
 		}
 
 		let mut locked_persister = self.persister.lock().await;
+		let superseded = self.superseded_onchain_txids().await?;
+		unconfirmed_txs.retain(|(tx, _)| !superseded.contains(&tx.compute_txid()));
 		let events = {
 			let mut locked_wallet = self.inner.lock().expect("lock");
 			locked_wallet
@@ -539,8 +546,13 @@ impl Wallet {
 					// Collect all conflict txids
 					let mut conflict_txids: Vec<Txid> =
 						conflicts.iter().map(|(_, conflict_txid)| *conflict_txid).collect();
+					if let Some(previous) = self.pending_payment_store.get(&payment_id).await? {
+						conflict_txids.extend(previous.conflicting_txids);
+					}
 
 					conflict_txids.push(txid);
+					conflict_txids.sort_unstable();
+					conflict_txids.dedup();
 					// The payment already exists in the store at this point: `bump_fee_rbf`
 					// updates the payment store with the replacement txid before the next sync
 					// cycle, and an id resolved through the candidate history comes from a
@@ -1946,6 +1958,34 @@ impl Wallet {
 		Ok(None)
 	}
 
+	/// Earlier rounds of a local on-chain RBF payment, which a lagging chain source may
+	/// still report as unconfirmed after the newer round was applied locally.
+	async fn superseded_onchain_txids(&self) -> Result<HashSet<Txid>, Error> {
+		let payments = self
+			.pending_payment_store
+			.list_filter(|p| {
+				matches!(
+					p.details.kind,
+					PaymentKind::Onchain {
+						status: ConfirmationStatus::Unconfirmed,
+						tx_type: None,
+						..
+					}
+				) && !p.conflicting_txids.is_empty()
+			})
+			.await;
+		Ok(payments
+			.into_iter()
+			.flat_map(|p| {
+				let active = match p.details.kind {
+					PaymentKind::Onchain { txid, .. } => txid,
+					_ => unreachable!(),
+				};
+				p.conflicting_txids.into_iter().filter(move |txid| *txid != active)
+			})
+			.collect())
+	}
+
 	/// If `payment_id` refers to a classified funding payment, refreshes its confirmation status
 	/// and the candidate txid the event refers to, while preserving the contribution-derived
 	/// amount/fee and `tx_type` that wallet sync must not recompute from its own view: the wallet's
@@ -2260,8 +2300,32 @@ impl Wallet {
 			ConfirmationStatus::Unconfirmed,
 		);
 
+		let mut conflicts = self
+			.pending_payment_store
+			.get(&payment_id)
+			.await?
+			.map(|p| p.conflicting_txids)
+			.unwrap_or_default();
+		conflicts.push(txid);
+		conflicts.sort_unstable();
+		conflicts.dedup();
 		let pending_payment_store =
-			self.create_pending_payment_from_tx(new_payment.clone(), Vec::new());
+			self.create_pending_payment_from_tx(new_payment.clone(), conflicts);
+		let seen_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
+		let previous_seen_at = locked_wallet
+			.tx_details(txid)
+			.and_then(|details| match details.chain_position {
+				bdk_chain::ChainPosition::Unconfirmed { last_seen, .. } => last_seen,
+				_ => None,
+			})
+			.unwrap_or(0);
+		locked_wallet.apply_unconfirmed_txs([(
+			fee_bumped_tx.clone(),
+			seen_at.max(previous_seen_at.saturating_add(1)),
+		)]);
 		let change_set = locked_wallet.take_staged().unwrap_or_default();
 		drop(locked_wallet);
 		locked_persister.persist_changeset(change_set).await.map_err(|e| {
